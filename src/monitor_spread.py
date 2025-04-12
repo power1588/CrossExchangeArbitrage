@@ -114,18 +114,15 @@ class SpreadMonitor:
             
         ex1, ex2, action1, action2 = max_spread_exchanges
         
-        message = (
-            f"🔔 价差提醒\n"
-            f"交易对: {symbol}\n"
-            f"交易所: {ex1} - {ex2}\n"
-            f"操作: 在 {ex1} {action1}，在 {ex2} {action2}\n"
-            f"价差: {spread:.2f}%\n"
-            f"价格: {bbo_info[ex1]['bid']:.4f} - {bbo_info[ex2]['ask']:.4f}"
-        )
+        # 准备价格信息
+        prices = {
+            ex1: bbo_info[ex1]['bid'] if action1 == 'sell' else bbo_info[ex1]['ask'],
+            ex2: bbo_info[ex2]['bid'] if action2 == 'sell' else bbo_info[ex2]['ask']
+        }
         
         for notifier in self.notifiers:
             try:
-                await notifier.send_message(message)
+                await notifier.send_spread_alert(symbol, spread, prices)
             except Exception as e:
                 logger.error(f"发送价差提醒失败: {e}")
                 
@@ -134,69 +131,28 @@ class SpreadMonitor:
         if not self.notifiers:
             return
             
-        message = "📊 定期价差播报\n\n"
-        
+        # 获取所有交易对的BBO信息
+        bbo_info = {}
         for symbol in self._get_common_symbols():
-            try:
-                # 获取所有交易所的BBO信息
-                bbo_info = {}
-                for exchange in self.config.exchanges:
-                    exchange_id = exchange['name']
+            symbol_info = {}
+            for exchange in self.config.exchanges:
+                exchange_id = exchange['name']
+                try:
                     info = await self.exchange_manager.get_bbo_info(exchange_id, symbol)
                     if info['bid'] and info['ask']:
-                        bbo_info[exchange_id] = info
-                        
-                if len(bbo_info) < 2:
-                    continue
+                        symbol_info[exchange_id] = info
+                except Exception as e:
+                    logger.error(f"获取 {exchange_id} {symbol} BBO信息时出错: {e}")
                     
-                message += f"🔸 {symbol}:\n"
+            if symbol_info:
+                bbo_info[symbol] = symbol_info
                 
-                # 计算最大价差
-                max_spread = 0
-                max_spread_exchanges = None
-                
-                for ex1 in bbo_info:
-                    for ex2 in bbo_info:
-                        if ex1 >= ex2:
-                            continue
-                            
-                        # 计算价差
-                        bid1 = bbo_info[ex1]['bid']
-                        ask1 = bbo_info[ex1]['ask']
-                        bid2 = bbo_info[ex2]['bid']
-                        ask2 = bbo_info[ex2]['ask']
-                        
-                        # 计算套利空间
-                        spread1 = (bid2 - ask1) / ask1 * 100  # 在 ex1 买入，在 ex2 卖出
-                        spread2 = (bid1 - ask2) / ask2 * 100  # 在 ex2 买入，在 ex1 卖出
-                        
-                        if spread1 > max_spread:
-                            max_spread = spread1
-                            max_spread_exchanges = (ex1, ex2, 'buy', 'sell')
-                            
-                        if spread2 > max_spread:
-                            max_spread = spread2
-                            max_spread_exchanges = (ex2, ex1, 'buy', 'sell')
-                            
-                # 添加最大价差信息
-                if max_spread_exchanges:
-                    ex1, ex2, action1, action2 = max_spread_exchanges
-                    message += f"最大价差: {max_spread:.2f}%\n"
-                    message += f"在 {ex1} {action1}，在 {ex2} {action2}\n"
-                    
-                # 添加各交易所的 BBO 信息
-                message += "\n各交易所 BBO:\n"
-                for exchange, info in bbo_info.items():
-                    message += f"{exchange}: 买 {info['bid']:.4f} 卖 {info['ask']:.4f} (价差: {info['spread']:.2f}%)\n"
-                    
-                message += "\n"
-                
-            except Exception as e:
-                logger.error(f"获取 {symbol} BBO信息时出错: {e}")
-                
+        if not bbo_info:
+            return
+            
         for notifier in self.notifiers:
             try:
-                await notifier.send_message(message)
+                await notifier.send_periodic_alert(bbo_info)
             except Exception as e:
                 logger.error(f"发送定期提醒失败: {e}")
                 
