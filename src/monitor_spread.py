@@ -1,236 +1,245 @@
 import asyncio
-import yaml
-import os
 import argparse
-import time
-from typing import Dict
-from dotenv import load_dotenv
+import logging
+from typing import Dict, Any, List
 from loguru import logger
-from core.exchange import ExchangeManager
-from utils.notifier import LarkNotifier
+import sys
+import os
+import time
+
+# 添加项目根目录到Python路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.core.config import Config
+from src.core.exchange import ExchangeManager
+from src.core.notifier import NotifierFactory
 
 class SpreadMonitor:
-    def __init__(self, config: dict, symbol: str = None):
+    def __init__(self, config: Config):
         self.config = config
-        self.exchange_manager = None
+        self.exchange_manager = ExchangeManager(config)
+        self.notifiers = [NotifierFactory.create_notifier(notifier_config) for notifier_config in config.notifiers]
         self.running = False
-        self.last_alert_time = {}  # 记录上次提醒时间
-        self.last_periodic_alert_time = 0  # 记录上次定时提醒时间
+        self.last_alert_time = 0
+        self.last_periodic_alert_time = 0
         
-        # 如果指定了symbol，覆盖配置文件中的设置
-        if symbol:
-            self.config['strategy']['symbol'] = symbol
-            
-        # 初始化通知器
-        if config.get('notifications', {}).get('lark_webhook'):
-            self.notifier = LarkNotifier(config['notifications']['lark_webhook'])
-        else:
-            self.notifier = None
-            
     async def initialize(self):
-        """初始化交易所连接"""
-        self.exchange_manager = ExchangeManager(self.config)
+        """初始化监控器"""
         await self.exchange_manager.initialize()
-        logger.info(f"Monitoring spread for {self.config['strategy']['symbol']}")
+        logger.info("交易所初始化成功")
         
     async def start(self):
         """启动监控"""
         self.running = True
-        symbol = self.config['strategy']['symbol']
+        logger.info("开始监控价差")
         
-        # 启动订单簿数据流
-        orderbook_tasks = await self.exchange_manager.start_orderbook_stream(symbol)
-        
-        # 启动监控主循环
-        monitor_task = asyncio.create_task(self._run_monitor())
-        
-        return orderbook_tasks + [monitor_task]
-        
-    async def _run_monitor(self):
-        """监控主循环"""
         while self.running:
             try:
-                # 获取各交易所最优价格
-                prices = await self.exchange_manager.get_best_prices(
-                    self.config['strategy']['symbol']
-                )
-                
-                if len(prices) < 2:
-                    await asyncio.sleep(0.1)
-                    continue
-                    
-                # 监控价差
-                await self._monitor_spreads(prices)
-                
-                # 打印当前价差
-                self._print_spreads(prices)
-                
-                # 检查是否需要定时播报
-                await self._check_periodic_alert(prices)
-                
-                await asyncio.sleep(0.1)  # 控制循环频率
-                
+                await self.check_spreads()
+                await self.check_periodic_alert()
+                await asyncio.sleep(self.config.check_interval)
             except Exception as e:
-                logger.error(f"Error in monitor loop: {str(e)}")
-                await asyncio.sleep(1)
+                logger.error(f"监控循环出错: {e}")
+                await asyncio.sleep(5)  # 出错后等待5秒再重试
                 
-    async def _monitor_spreads(self, prices: Dict[str, dict]):
-        """监控价差并发送提醒"""
-        # 检查是否启用阈值告警
-        if not self.config['monitoring']['threshold_alerts']['enabled']:
-            return
-            
-        alert_threshold = self.config['monitoring']['threshold_alerts']['threshold']
-        alert_interval = self.config['monitoring']['threshold_alerts']['interval']
-        current_time = asyncio.get_event_loop().time()
+    async def stop(self):
+        """停止监控"""
+        self.running = False
+        await self.exchange_manager.close()
+        logger.info("监控已停止")
         
-        for ex1 in prices:
-            for ex2 in prices:
-                if ex1 >= ex2:
+    async def check_spreads(self):
+        """检查价差"""
+        for symbol in self._get_common_symbols():
+            try:
+                # 获取所有交易所的BBO信息
+                bbo_info = {}
+                for exchange in self.config.exchanges:
+                    exchange_id = exchange['name']
+                    info = await self.exchange_manager.get_bbo_info(exchange_id, symbol)
+                    if info['bid'] and info['ask']:
+                        bbo_info[exchange_id] = info
+                        
+                if len(bbo_info) < 2:
                     continue
                     
-                # 计算价差
-                spread1 = prices[ex2]['bid'] / prices[ex1]['ask'] - 1
-                spread2 = prices[ex1]['bid'] / prices[ex2]['ask'] - 1
+                # 计算最大价差
+                max_spread = 0
+                max_spread_exchanges = None
                 
-                # 检查是否需要发送提醒
-                pair_key = f"{ex1}_{ex2}"
-                last_alert = self.last_alert_time.get(pair_key, 0)
-                
-                if (spread1 > alert_threshold or spread2 > alert_threshold) and \
-                   (current_time - last_alert) > alert_interval:
-                    if self.notifier:
-                        await self.notifier.send_spread_alert(
-                            self.config['strategy']['symbol'],
-                            ex1, ex2,
-                            max(spread1, spread2),
-                            prices[ex1]['bid'],
-                            prices[ex2]['ask']
-                        )
-                    self.last_alert_time[pair_key] = current_time
-                    
-    async def _check_periodic_alert(self, prices: Dict[str, dict]):
-        """检查是否需要定时播报"""
-        # 检查是否启用定时播报
-        if not self.config['monitoring']['periodic_alerts']['enabled']:
-            return
-            
-        current_time = asyncio.get_event_loop().time()
-        periodic_interval = self.config['monitoring']['periodic_alerts']['interval']
-        
-        if current_time - self.last_periodic_alert_time > periodic_interval:
-            if self.notifier:
-                # 收集所有价差信息
-                spreads_info = []
-                for ex1 in prices:
-                    for ex2 in prices:
+                for ex1 in bbo_info:
+                    for ex2 in bbo_info:
                         if ex1 >= ex2:
                             continue
                             
                         # 计算价差
-                        spread1 = prices[ex2]['bid'] / prices[ex1]['ask'] - 1
-                        spread2 = prices[ex1]['bid'] / prices[ex2]['ask'] - 1
+                        bid1 = bbo_info[ex1]['bid']
+                        ask1 = bbo_info[ex1]['ask']
+                        bid2 = bbo_info[ex2]['bid']
+                        ask2 = bbo_info[ex2]['ask']
                         
-                        spreads_info.append({
-                            'ex1': ex1,
-                            'ex2': ex2,
-                            'spread1': spread1,
-                            'spread2': spread2,
-                            'bid1': prices[ex1]['bid'],
-                            'ask1': prices[ex1]['ask'],
-                            'bid2': prices[ex2]['bid'],
-                            'ask2': prices[ex2]['ask']
-                        })
+                        # 计算套利空间
+                        spread1 = (bid2 - ask1) / ask1 * 100  # 在 ex1 买入，在 ex2 卖出
+                        spread2 = (bid1 - ask2) / ask2 * 100  # 在 ex2 买入，在 ex1 卖出
+                        
+                        if spread1 > max_spread:
+                            max_spread = spread1
+                            max_spread_exchanges = (ex1, ex2, 'buy', 'sell')
+                            
+                        if spread2 > max_spread:
+                            max_spread = spread2
+                            max_spread_exchanges = (ex2, ex1, 'buy', 'sell')
+                            
+                # 如果价差超过阈值，发送提醒
+                if max_spread >= self.config.min_spread:
+                    current_time = time.time()
+                    if current_time - self.last_alert_time >= self.config.alert_interval:
+                        await self._send_spread_alert(symbol, max_spread, bbo_info, max_spread_exchanges)
+                        self.last_alert_time = current_time
+                        
+            except Exception as e:
+                logger.error(f"检查 {symbol} 价差时出错: {e}")
                 
-                # 发送定时播报
-                await self._send_periodic_alert(spreads_info)
-                
+    async def check_periodic_alert(self):
+        """检查是否需要发送定期提醒"""
+        current_time = time.time()
+        if current_time - self.last_periodic_alert_time >= self.config.periodic_alert_interval:
+            await self._send_periodic_alert()
             self.last_periodic_alert_time = current_time
             
-    async def _send_periodic_alert(self, spreads_info):
-        """发送定时价差播报"""
-        symbol = self.config['strategy']['symbol']
-        current_time = time.strftime("%Y-%m-%d %H:%M:%S")
-        
-        title = f"价差定时播报 - {symbol} - {current_time}"
-        
-        # 构建内容
-        content = f"交易对: {symbol}\n时间: {current_time}\n\n"
-        
-        for info in spreads_info:
-            content += f"{info['ex1']} -> {info['ex2']}: {info['spread1']:.4%}\n"
-            content += f"  买入价: {info['bid1']:.2f}, 卖出价: {info['ask1']:.2f}\n"
-            content += f"{info['ex2']} -> {info['ex1']}: {info['spread2']:.4%}\n"
-            content += f"  买入价: {info['bid2']:.2f}, 卖出价: {info['ask2']:.2f}\n\n"
+    async def _send_spread_alert(self, symbol: str, spread: float, bbo_info: Dict[str, Dict[str, Any]], max_spread_exchanges: tuple):
+        """发送价差提醒"""
+        if not self.notifiers:
+            return
             
-        await self.notifier.send_message(title, content)
-                    
-    def _print_spreads(self, prices: Dict[str, dict]):
-        """打印当前价差"""
-        symbol = self.config['strategy']['symbol']
-        print(f"\n=== {symbol} 价差监控 ===")
-        print(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        ex1, ex2, action1, action2 = max_spread_exchanges
         
-        for ex1 in prices:
-            for ex2 in prices:
-                if ex1 >= ex2:
+        message = (
+            f"🔔 价差提醒\n"
+            f"交易对: {symbol}\n"
+            f"交易所: {ex1} - {ex2}\n"
+            f"操作: 在 {ex1} {action1}，在 {ex2} {action2}\n"
+            f"价差: {spread:.2f}%\n"
+            f"价格: {bbo_info[ex1]['bid']:.4f} - {bbo_info[ex2]['ask']:.4f}"
+        )
+        
+        for notifier in self.notifiers:
+            try:
+                await notifier.send_message(message)
+            except Exception as e:
+                logger.error(f"发送价差提醒失败: {e}")
+                
+    async def _send_periodic_alert(self):
+        """发送定期提醒"""
+        if not self.notifiers:
+            return
+            
+        message = "📊 定期价差播报\n\n"
+        
+        for symbol in self._get_common_symbols():
+            try:
+                # 获取所有交易所的BBO信息
+                bbo_info = {}
+                for exchange in self.config.exchanges:
+                    exchange_id = exchange['name']
+                    info = await self.exchange_manager.get_bbo_info(exchange_id, symbol)
+                    if info['bid'] and info['ask']:
+                        bbo_info[exchange_id] = info
+                        
+                if len(bbo_info) < 2:
                     continue
                     
-                # 计算价差
-                spread1 = prices[ex2]['bid'] / prices[ex1]['ask'] - 1
-                spread2 = prices[ex1]['bid'] / prices[ex2]['ask'] - 1
+                message += f"🔸 {symbol}:\n"
                 
-                print(f"{ex1} -> {ex2}: {spread1:.4%}")
-                print(f"{ex2} -> {ex1}: {spread2:.4%}")
+                # 计算最大价差
+                max_spread = 0
+                max_spread_exchanges = None
                 
-        print("=" * 30)
+                for ex1 in bbo_info:
+                    for ex2 in bbo_info:
+                        if ex1 >= ex2:
+                            continue
+                            
+                        # 计算价差
+                        bid1 = bbo_info[ex1]['bid']
+                        ask1 = bbo_info[ex1]['ask']
+                        bid2 = bbo_info[ex2]['bid']
+                        ask2 = bbo_info[ex2]['ask']
+                        
+                        # 计算套利空间
+                        spread1 = (bid2 - ask1) / ask1 * 100  # 在 ex1 买入，在 ex2 卖出
+                        spread2 = (bid1 - ask2) / ask2 * 100  # 在 ex2 买入，在 ex1 卖出
+                        
+                        if spread1 > max_spread:
+                            max_spread = spread1
+                            max_spread_exchanges = (ex1, ex2, 'buy', 'sell')
+                            
+                        if spread2 > max_spread:
+                            max_spread = spread2
+                            max_spread_exchanges = (ex2, ex1, 'buy', 'sell')
+                            
+                # 添加最大价差信息
+                if max_spread_exchanges:
+                    ex1, ex2, action1, action2 = max_spread_exchanges
+                    message += f"最大价差: {max_spread:.2f}%\n"
+                    message += f"在 {ex1} {action1}，在 {ex2} {action2}\n"
+                    
+                # 添加各交易所的 BBO 信息
+                message += "\n各交易所 BBO:\n"
+                for exchange, info in bbo_info.items():
+                    message += f"{exchange}: 买 {info['bid']:.4f} 卖 {info['ask']:.4f} (价差: {info['spread']:.2f}%)\n"
+                    
+                message += "\n"
+                
+            except Exception as e:
+                logger.error(f"获取 {symbol} BBO信息时出错: {e}")
+                
+        for notifier in self.notifiers:
+            try:
+                await notifier.send_message(message)
+            except Exception as e:
+                logger.error(f"发送定期提醒失败: {e}")
+                
+    def _get_common_symbols(self) -> List[str]:
+        """获取所有交易所共同的交易对"""
+        common_symbols = set()
+        first = True
         
-    def stop(self):
-        """停止监控"""
-        self.running = False
-        logger.info("Monitor stopped")
-        
+        for exchange in self.config.exchanges:
+            symbols = set(symbol for symbol in exchange['symbols'] if symbol.endswith('/USDT'))
+            if first:
+                common_symbols = symbols
+                first = False
+            else:
+                common_symbols &= symbols
+                
+        return list(common_symbols)
+
 async def main():
-    # 解析命令行参数
-    parser = argparse.ArgumentParser(description='监控特定symbol的价差')
-    parser.add_argument('--symbol', type=str, help='要监控的交易对，例如 BTC/USDT:USDT')
-    parser.add_argument('--config', type=str, default='config/config.yaml', help='配置文件路径')
+    """主函数"""
+    parser = argparse.ArgumentParser(description='监控交易所价差')
+    parser.add_argument('--config', type=str, default='config.yaml', help='配置文件路径')
     args = parser.parse_args()
     
-    # 加载环境变量
-    load_dotenv()
-    
-    # 加载配置
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
-        
-    # 设置日志
-    logger.add(
-        config['logging']['file'],
-        level=config['logging']['level'],
-        rotation="1 day"
-    )
-    
     try:
-        # 初始化监控器
-        monitor = SpreadMonitor(config, args.symbol)
+        # 加载配置
+        config = Config(args.config)
+        logger.info("配置加载成功")
+        
+        # 创建并启动监控器
+        monitor = SpreadMonitor(config)
         await monitor.initialize()
         
-        # 启动监控
-        tasks = await monitor.start()
-        
-        # 等待监控运行
-        await asyncio.gather(*tasks)
-        
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
+        try:
+            await monitor.start()
+        except KeyboardInterrupt:
+            logger.info("收到停止信号")
+        finally:
+            await monitor.stop()
+            
     except Exception as e:
-        logger.error(f"Error in main loop: {str(e)}")
-    finally:
-        # 清理资源
-        monitor.stop()
-        if monitor.exchange_manager:
-            await monitor.exchange_manager.close()
-        
+        logger.error(f"程序运行出错: {e}")
+        sys.exit(1)
+
 if __name__ == "__main__":
     asyncio.run(main()) 
