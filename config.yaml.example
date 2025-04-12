@@ -1,0 +1,61 @@
+# 交易所配置
+exchanges:
+  - name: binance
+    type: binance
+    mode: public  # 可选值: public(仅获取公开行情), private(支持交易)
+    api_key: your_api_key_here  # 仅在 mode=private 时需要
+    api_secret: your_api_secret_here  # 仅在 mode=private 时需要
+    testnet: false
+    symbols:
+      - ORCA/USDT
+      - BTC/USDT
+      - ETH/USDT
+  
+  - name: okx
+    type: okx
+    mode: public  # 可选值: public(仅获取公开行情), private(支持交易)
+    api_key: your_api_key_here  # 仅在 mode=private 时需要
+    api_secret: your_api_secret_here  # 仅在 mode=private 时需要
+    password: your_password_here  # 仅在 mode=private 时需要
+    testnet: false
+    symbols:
+      - ORCA/USDT
+      - BTC/USDT
+      - ETH/USDT
+      
+  - name: gate
+    type: gate
+    mode: public  # 可选值: public(仅获取公开行情), private(支持交易)
+    api_key: your_api_key_here  # 仅在 mode=private 时需要
+    api_secret: your_api_secret_here  # 仅在 mode=private 时需要
+    testnet: false
+    symbols:
+      - ORCA/USDT
+      - BTC/USDT
+      - ETH/USDT
+      
+  - name: htx
+    type: htx
+    mode: public  # 可选值: public(仅获取公开行情), private(支持交易)
+    api_key: your_api_key_here  # 仅在 mode=private 时需要
+    api_secret: your_api_secret_here  # 仅在 mode=private 时需要
+    testnet: false
+    symbols:
+      - ORCA/USDT
+      - BTC/USDT
+      - ETH/USDT
+
+# 通知器配置
+notifiers:
+  - type: lark
+    webhook_url: your_webhook_url_here
+  
+  - type: telegram
+    bot_token: your_bot_token_here
+    chat_id: your_chat_id_here
+
+# 策略参数
+min_spread: 0.5  # 最小价差阈值（百分比）
+check_interval: 60  # 检查间隔（秒）
+alert_interval: 300  # 提醒间隔（秒）
+periodic_alert_interval: 3600  # 定时播报间隔（秒） 
